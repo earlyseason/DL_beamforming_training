@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 
-class Beam_Estimator_1D(nn.Module):  
+class Beam_Estimator_1D(nn.Module):
     """
     波束质量估计网络 (1D Super-Resolution)
 
@@ -83,6 +83,68 @@ class Beam_Estimator_1D(nn.Module):
 
         # Squeeze 通道维度: [B, 1, 32] → [B, 32]
         out = x.squeeze(1)
+
+        return out
+
+
+class Beam_Estimator_FC(nn.Module):
+    """
+    波束质量估计网络 - 全连接版本
+
+    改进动机:
+        原 1D-CNN 架构的转置卷积(kernel=4, stride=4)导致每个输出位置
+        只能看到 1 个输入宽波束,无法提取跨宽波束的功率比信息。
+        全连接层让网络能同时看到所有 8 个宽波束的全局关系。
+
+    网络结构:
+        Input:  [B, 8]
+        FC1:    Linear(8 → 64) + ReLU
+        FC2:    Linear(64 → 128) + ReLU + Dropout(0.2)
+        FC3:    Linear(128 → 32) + Sigmoid
+        Output: [B, 32]
+
+    参数量: 8*64 + 64*128 + 128*32 = 512 + 8192 + 4096 = 12800
+    """
+
+    def __init__(self, n_wide=8, n_narrow=32, hidden_dims=[64, 128]):
+        """
+        参数:
+            n_wide: 宽波束数量(输入维度)
+            n_narrow: 窄波束数量(输出维度)
+            hidden_dims: 隐藏层维度列表
+        """
+        super(Beam_Estimator_FC, self).__init__()
+
+        self.n_wide = n_wide
+        self.n_narrow = n_narrow
+
+        # 全连接网络
+        self.fc_net = nn.Sequential(
+            nn.Linear(n_wide, hidden_dims[0]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[0], hidden_dims[1]),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dims[1], n_narrow),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        """
+        前向传播
+
+        参数:
+            x: 输入张量，shape = [B, 8] 或 [B, 1, 8]
+
+        返回:
+            out: 预测的窄波束功率，shape = [B, 32]
+        """
+        # 如果输入是 [B, 1, 8],squeeze 掉通道维度
+        if x.dim() == 3:
+            x = x.squeeze(1)
+
+        # [B, 8] → [B, 32]
+        out = self.fc_net(x)
 
         return out
 

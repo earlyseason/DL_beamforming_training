@@ -65,9 +65,10 @@ def main():
     # ============ 1. 生成码本 ============
     print("\n[1/5] 生成码本...")
     narrow_codebook = generate_dft_codebook(M, N_narrow)
+    # 当前最佳: 子阵列方法（即使有栅瓣，但宽主瓣保证了角度覆盖）
     wide_codebook = generate_wide_codebook_subarray(M, N_wide)
-    print(f"  窄波束码本: shape = {narrow_codebook.shape}")
-    print(f"  宽波束码本: shape = {wide_codebook.shape}")
+    print(f"  窄波束码本 (DFT-32): shape = {narrow_codebook.shape}")
+    print(f"  宽波束码本 (子阵列-8): shape = {wide_codebook.shape}")
 
     # ============ 2. 功率参数 ============
     P_tx_linear = 10 ** (P_tx_dBm / 10) / 1000  # dBm → Watt

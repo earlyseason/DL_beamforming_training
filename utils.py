@@ -30,11 +30,16 @@ def generate_dft_codebook(num_antennas, num_beams):
 
 def generate_wide_codebook_subarray(num_antennas, num_wide_beams):
     """
-    生成宽波束码本 —— 子阵列方法
+    生成宽波束码本 —— 子阵列方法（旧方案）
 
     原理：从 M 根天线中取中间 N_wide 根天线构成子阵列，
     对子阵列生成 DFT 码本，其余天线位置填零。
     子阵列孔径小 → 波束宽度大 → 实现低分辨率覆盖。
+
+    缺陷:
+        - 旁瓣高（-9 dB），存在严重栅瓣
+        - 峰值低（-6 dB，因为 24 根天线置零）
+        - 主瓣交叠仅 -10 dB（重叠不足）
 
     参数:
         num_antennas: 总天线数 M
