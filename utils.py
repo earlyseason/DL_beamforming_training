@@ -100,6 +100,130 @@ def compute_beam_power(channel, codebook, snr_linear, P_tx_linear):
     return rx_power
 
 
+def compute_beam_signal_power(channel, codebook, P_tx_linear):
+    """
+    计算无噪声的接收信号功率(用于在线噪声重采样)
+
+    与 compute_beam_power 相比,本函数不加噪声,
+    便于训练时每个 batch 在线生成不同的噪声实现,
+    起到数据增强的作用。
+
+    参数:
+        channel: 信道向量 h, shape = (M,) 复数
+        codebook: 码本矩阵, shape = (M, N_beams)
+        P_tx_linear: 线性发送功率
+
+    返回:
+        signal_power: 无噪声功率, shape = (N_beams,)
+    """
+    beam_gains = channel.conj() @ codebook
+    return P_tx_linear * np.abs(beam_gains) ** 2
+
+
+def add_noise_to_power_torch(signal_power, snr_linear, generator=None):
+    """
+    Torch 版本的加噪函数,用于训练循环中批量在线加噪 (GPU 友好)
+
+    噪声模型与 compute_beam_power 保持一致:
+        noise_power = mean(signal_power_per_sample) / SNR
+        noise ~ noise_power * |N(0,1) + j*N(0,1)|^2 / 2
+
+    参数:
+        signal_power: 无噪声功率 tensor, shape = (B, n_beams)
+                     每个样本独立加噪
+        snr_linear: 线性 SNR
+        generator: torch.Generator (可选, 控制随机性)
+
+    返回:
+        rx_power: 含噪声功率 tensor, 同 shape
+    """
+    import torch
+
+    avg_signal = signal_power.mean(dim=-1, keepdim=True)  # (B, 1)
+    noise_power = avg_signal / snr_linear
+
+    shape = signal_power.shape
+    if generator is not None:
+        re = torch.randn(shape, generator=generator,
+                         device=signal_power.device,
+                         dtype=signal_power.dtype)
+        im = torch.randn(shape, generator=generator,
+                         device=signal_power.device,
+                         dtype=signal_power.dtype)
+    else:
+        re = torch.randn(shape, device=signal_power.device,
+                         dtype=signal_power.dtype)
+        im = torch.randn(shape, device=signal_power.device,
+                         dtype=signal_power.dtype)
+
+    noise = noise_power * (re ** 2 + im ** 2) / 2
+    return signal_power + noise
+
+
+def normalize_power_torch(power_data, eps=1e-30):
+    """
+    Torch 版本的逐样本 dB 归一化(用于在线增强后的归一化)
+
+    参数:
+        power_data: shape = (B, n_beams), 线性功率(>=0)
+
+    返回:
+        normalized: shape = (B, n_beams), 范围 [0, 1]
+    """
+    import torch
+
+    power_dB = 10 * torch.log10(power_data + eps)
+    p_min = power_dB.min(dim=-1, keepdim=True).values
+    p_max = power_dB.max(dim=-1, keepdim=True).values
+    denom = p_max - p_min
+    denom = torch.where(denom < 1e-10, torch.ones_like(denom), denom)
+    return (power_dB - p_min) / denom
+
+
+def random_beam_dropout_torch(power_linear, p_apply=0.5, max_drop=2):
+    """
+    Beam Dropout: 每个样本以 p_apply 概率丢弃 1~max_drop 个波束
+
+    在线性功率域置零,后续 dB 归一化时被置零位置自然成为最弱(归一化为 0)。
+    用于训练时强迫网络学习"缺失某波束读数也能推出整体分布"的稳健表示。
+
+    参数:
+        power_linear: (B, n_beams) 线性功率(>=0)
+        p_apply: 每个样本应用 dropout 的概率
+        max_drop: 单样本最多丢弃的波束数
+
+    返回:
+        masked: 同 shape, 被丢弃位置为 0
+    """
+    import torch
+
+    B, n_beams = power_linear.shape
+    device = power_linear.device
+
+    # 每个样本是否应用 dropout
+    apply_mask = torch.rand(B, device=device) < p_apply
+
+    # 每个样本丢弃的数量(1 ~ max_drop)
+    n_drops = torch.randint(1, max_drop + 1, (B,), device=device)
+
+    # 用随机数排序后取前 k 个,等价于无放回随机选 k 个位置
+    rand_vals = torch.rand(B, n_beams, device=device)
+    sorted_indices = rand_vals.argsort(dim=1)
+
+    # 构造每个样本的 keep mask
+    pos_idx = torch.arange(n_beams, device=device).unsqueeze(0).expand(B, -1)
+    drop_count = n_drops.unsqueeze(1)            # (B, 1)
+    drop_in_sorted = (pos_idx < drop_count)       # (B, n_beams) bool
+
+    keep_mask = torch.ones_like(power_linear)
+    keep_mask.scatter_(1, sorted_indices, (~drop_in_sorted).float())
+
+    # 不应用 dropout 的样本保持全 1
+    keep_mask[~apply_mask] = 1.0
+
+    return power_linear * keep_mask
+
+
 def process_beam_data(channels, narrow_codebook, wide_codebook,
                       snr_linear, P_tx_linear, N_wide, N_narrow):
     """

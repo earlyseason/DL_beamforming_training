@@ -19,6 +19,7 @@ from utils import (
     generate_dft_codebook,
     generate_wide_codebook_subarray,
     compute_beam_power,
+    compute_beam_signal_power,
     process_beam_data,
     construct_sliding_window,
     normalize_power,
@@ -104,6 +105,16 @@ def main():
     print(f"  宽波束功率 X: shape = {wide_powers.shape}")
     print(f"  窄波束功率 Y: shape = {narrow_powers.shape}")
 
+    # 同时保存"无噪声信号功率",供训练时在线噪声重采样使用
+    print("  额外计算无噪声信号功率(用于在线噪声增强)...")
+    wide_signal = np.zeros_like(wide_powers)
+    narrow_signal = np.zeros_like(narrow_powers)
+    for i in range(channels.shape[0]):
+        wide_signal[i] = compute_beam_signal_power(
+            channels[i], wide_codebook, P_tx_linear)
+        narrow_signal[i] = compute_beam_signal_power(
+            channels[i], narrow_codebook, P_tx_linear)
+
     # 归一化
     wide_norm, w_min, w_max = normalize_power(wide_powers)
     narrow_norm, n_min, n_max = normalize_power(narrow_powers)
@@ -157,6 +168,9 @@ def main():
              Y_narrow=narrow_norm,
              X_wide_raw=wide_powers,
              Y_narrow_raw=narrow_powers,
+             X_wide_signal=wide_signal,
+             Y_narrow_signal=narrow_signal,
+             snr_linear=snr_linear,
              norm_params_wide=np.array([w_min, w_max]),
              norm_params_narrow=np.array([n_min, n_max]),
              codebook_narrow=narrow_codebook,

@@ -149,6 +149,154 @@ class Beam_Estimator_FC(nn.Module):
         return out
 
 
+class TransformerEncoderBlock(nn.Module):
+    """
+    单层 Transformer 编码器(Pre-LN 结构)
+
+    结构:
+        x → LN → MSA → +residual → LN → MLP(SiLU) → +residual
+    """
+
+    def __init__(self, dim, num_heads, mlp_dim, dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        # MSA 子模块
+        h = self.norm1(x)
+        attn_out, _ = self.attn(h, h, h, need_weights=False)
+        x = x + attn_out
+
+        # MLP 子模块
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class Beam_Estimator_BT(nn.Module):
+    """
+    Beam Transformer 波束估计网络(方案 B:BT 架构 + KL 软标签)
+
+    参考论文: Beam Transformer (BT) 算法
+    改进点(相对原 BT):
+        - 输出层:Sigmoid 替代 Softmax,保留功率分布的软排序信息
+        - 损失:KL 散度(在 train 端实现)替代 CE,保留超分辨率语义
+
+    架构:
+        Input  [B, N_wide=8]
+          ↓ 复制 M_cat 次          [B, M_cat, N_wide]
+          ↓ Linear(N_wide → dim)   [B, M_cat, dim]
+          ↓ 拼接 CLS token         [B, M_cat+1, dim]
+          ↓ + 位置编码              [B, M_cat+1, dim]
+          ↓ Transformer × L_BT     [B, M_cat+1, dim]
+          ↓ 取 CLS token           [B, dim]
+          ↓ MLP × L_FC (SiLU)
+          ↓ Sigmoid → [B, N_narrow=32]
+    """
+
+    def __init__(self,
+                 n_wide=8,
+                 n_narrow=32,
+                 dim=64,
+                 m_cat=4,
+                 num_heads=2,
+                 mlp_dim=None,        # 默认 2*n_narrow
+                 num_encoder_layers=1,
+                 num_classifier_layers=4,
+                 dropout=0.1):
+        super().__init__()
+
+        if mlp_dim is None:
+            mlp_dim = 2 * n_narrow  # 论文默认: mlp_dim = 2N
+
+        self.n_wide = n_wide
+        self.n_narrow = n_narrow
+        self.dim = dim
+        self.m_cat = m_cat
+
+        # 嵌入层: N_wide → dim
+        self.embed = nn.Linear(n_wide, dim)
+
+        # 可学习的 CLS token 和位置编码
+        # 序列长度 = m_cat + 1 (CLS + m_cat 个复制 token)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, m_cat + 1, dim))
+
+        # Transformer 编码器堆叠
+        self.encoder = nn.Sequential(*[
+            TransformerEncoderBlock(dim, num_heads, mlp_dim, dropout)
+            for _ in range(num_encoder_layers)
+        ])
+
+        # 编码器输出后的 LayerNorm(常见做法,稳定 CLS 表示)
+        self.norm = nn.LayerNorm(dim)
+
+        # 分类头(L_FC 层 MLP,前 L_FC-1 层用 SiLU)
+        classifier_layers = []
+        for _ in range(num_classifier_layers - 1):
+            classifier_layers.append(nn.Linear(dim, dim))
+            classifier_layers.append(nn.SiLU())
+            classifier_layers.append(nn.Dropout(dropout))
+        classifier_layers.append(nn.Linear(dim, n_narrow))
+        classifier_layers.append(nn.Sigmoid())  # 方案 B:Sigmoid 输出
+        self.classifier = nn.Sequential(*classifier_layers)
+
+        # 参数初始化
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+    def forward(self, x):
+        """
+        参数:
+            x: [B, n_wide] 或 [B, 1, n_wide]
+
+        返回:
+            out: [B, n_narrow],范围 [0, 1]
+        """
+        if x.dim() == 3:
+            x = x.squeeze(1)
+
+        B = x.size(0)
+
+        # 复制扩张: [B, n_wide] → [B, m_cat, n_wide]
+        x = x.unsqueeze(1).expand(-1, self.m_cat, -1)
+
+        # 嵌入: [B, m_cat, n_wide] → [B, m_cat, dim]
+        x = self.embed(x)
+
+        # 拼接 CLS token: [B, m_cat+1, dim]
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+
+        # 加位置编码
+        x = x + self.pos_embed
+
+        # Transformer 编码
+        x = self.encoder(x)
+        x = self.norm(x)
+
+        # 取 CLS token 作为全局表示
+        cls_out = x[:, 0]  # [B, dim]
+
+        # 分类头 → [B, n_narrow]
+        out = self.classifier(cls_out)
+
+        return out
+
+
 class Beam_Predictor_1D_LSTM(nn.Module):
     """
     波束质量预测网络 (1D-CNN + LSTM)
